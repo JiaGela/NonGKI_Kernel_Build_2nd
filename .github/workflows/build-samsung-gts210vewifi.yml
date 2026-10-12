@@ -1,0 +1,385 @@
+##
+## Stage 2 — 集成 KernelSU（backslashxx / xxksu）+ CONFIG_KSU_TAMPER_SYSCALL_TABLE
+##
+## 放到：<你的 fork>/.github/workflows/build-samsung-gts210vewifi.yml
+##
+## 依据：酷安 67192675（JackA1ltman《旧内核也吃 KernelSU 第四期》）· 报告 §5.2
+##       + backslashxx/KernelSU **tag v3.1.0-74** 的 kernel/{Kconfig,Makefile}（已逐字核对）
+##       + syphyr/android_kernel_samsung_msm8976 @ lineage-16.0 (40e9c5de) 实测锚点
+##
+## 关键点（全部已逐字核对过源码）：
+##   0) ★ KSU 源码钉在 tag v3.1.0-74，不是 master ★
+##      master 的 KSU_APP_PROFILE_VER=4，而本机唯一装得上的官方 Manager v3.1.0 只送 version=2，
+##      驱动做严格相等校验 => "为该软件更新 App Profile 失败"、su 授权不可用。
+##      v3.1.0-74 的 KSU_APP_PROFILE_VER=2，与 Manager 一致；同时 KSU_VERSION=32374、
+##      TAMPER 开关仍在、EXPECTED_SIZE/HASH 仍是 tiann 官方值。详见 README §4.6。
+##   1) xxksu = backslashxx/KernelSU，Kconfig 里没有 `depends on OVERLAY_FS`，
+##      所以这台没有 overlayfs 的 3.10 不会「编译绿但开机没 KSU」。
+##   2) 开 CONFIG_KSU_TAMPER_SYSCALL_TABLE=y 后，sys_reboot / sys_execve /
+##      sys_newfstatat / sys_faccessat 都用不到源码补丁 —— 所以
+##      "Patch for no-kprobe" 那一步是空的（上游原话：Needn't manual hook.）。
+##      该 tag 的 Kconfig help 原话："Personally tested on Linux 3.10 ~ 4.14, aarch64."
+##   3) 两处 static 仍必须由我们解掉：
+##        selinux_ops    —— v3.1.0-74 走 core_hook.c 的 `extern struct security_operations selinux_ops;`
+##                          直接链接引用（该版 Makefile 里没有对应探测宏）
+##        policy_rwlock  —— v3.1.0-74 仍有 Makefile 行首锚点探测
+##                          grep -q "^DEFINE_RWLOCK(policy_rwlock);" security/selinux/ss/services.c
+##      3.10 原文分别是 `static struct security_operations selinux_ops = {`(hooks.c:5828)
+##      和 `static DEFINE_RWLOCK(policy_rwlock);`(services.c:76)，带 static 就必然不命中。
+##
+## 本文件已包含 §5.2 的 4 行 Extra Kernel Options + KSU 版本自校验 + .config 断言。
+##
+
+name: Build Samsung Galaxy Tab S2 VE WiFi (Kernel 3.10 + KernelSU)
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  # ==================== Device ====================
+  DEVICE_NAME : "samsung_gts210vewifi"
+  DEVICE_CODENAME : "gts210vewifi"
+  ROM_TEXT : "lineageos18.1-kernelsu"
+
+  CUSTOM_CMDS : ""
+  EXTRA_CMDS : ""
+
+  # ==================== Kernel ====================
+  KERNEL_SOURCE : "https://github.com/syphyr/android_kernel_samsung_msm8976.git"
+  KERNEL_BRANCH : "lineage-16.0"
+
+  # ==================== Toolchain ====================
+  CLANG_SOURCE : ""
+  CLANG_BRANCH : ""
+
+  GCC_GNU : false
+  GCC_64_SOURCE : "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git"
+  GCC_64_BRANCH : "lineage-19.1"
+  GCC_32_SOURCE : "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git"
+  GCC_32_BRANCH : "lineage-19.1"
+
+  # ==================== defconfig ====================
+  DEFCONFIG_SOURCE : ""
+  DEFCONFIG_NAME : "gts210vewifi_defconfig"
+
+  # 这两项留空/false 表示「直接用内核源码树自带的 arch/arm64/configs/gts210vewifi_defconfig」，
+  # 不从 boot.img 里反解 defconfig。build-ready 里对应的分支：
+  #   if [ -n "$DEFCONFIG_SOURCE" ]            -> curl 下来覆盖 defconfig（我们不要）
+  #   elif [ -z "$DEFCONFIG_ORIGIN_IMAGE" ] && DEFCONFIG_FROM_BOOT == true -> 解 boot 取 ikconfig（我们不要）
+  # BOOT_SOURCE 只在 DEFCONFIG_FROM_BOOT=true 或 PACK_METHOD=MKBOOTIMG 时被读到；
+  # 上游 a71 也显式声明为 ""，这里对齐一下，避免出现未定义的 ${{ env.BOOT_SOURCE }}。
+  DEFCONFIG_ORIGIN_IMAGE : ""
+  DEFCONFIG_FROM_BOOT : false
+  BOOT_SOURCE : ""
+
+  # ==================== KernelSU ====================
+  # ★★ 必须钉在 fork 的 tag v3.1.0-74，不能用 master ★★  （证据见 README §4.6）
+  #   驱动里的 KSU_APP_PROFILE_VER 必须 == 2，才能和本机「唯一装得上的官方 Manager v3.1.0」对上：
+  #     master  : KSU_APP_PROFILE_VER=4  (tiann v3.3.0 代)  -> Manager 发 version=2 被驱动拒
+  #                                                          -> "为该软件更新 App Profile 失败"
+  #                                                          -> su 开关弹回、永远授权不了
+  #     v3.1.0-74: KSU_APP_PROFILE_VER=2  == Manager v3.1.0 ✅
+  #   该 tag 其余关键常量：
+  #     KSU_VERSION       = 32374   (> Manager 的 32302，方向正确)
+  #     KSU_TAMPER_SYSCALL_TABLE 仍存在（Kconfig help 明写 "tested on Linux 3.10 ~ 4.14, aarch64"）
+  #     EXPECTED_SIZE/HASH 仍是 tiann 官方值 => 继续用官方 Manager，不必改常量
+  KERNELSU_SOURCE : "https://github.com/backslashxx/KernelSU"
+  KERNELSU_BRANCH : "v3.1.0-74"
+
+  KERNELSU_AUTO_GET : "false"       # false => 走 KERNELSU_MANUAL，用上面显式 SOURCE + BRANCH(tag)
+  KERNELSU_AUTO_FORK : "xxksu"      # AUTO_GET=false 时不生效，仅保留语义标注
+  KERNELSU_METHOD : "manual"        # manual = git clone -b <tag> + symlink drivers/kernelsu + 接线 Makefile/Kconfig
+  HOOK_METHOD : "syscall"           # 走 syscall 表篡改；它本身不再需要手打补丁
+
+  SUSFS_ENABLE : false              # xxksu 不支持 SUSFS
+  SUSFS_FIXED : false
+
+  # 其余可选补丁一律关闭
+  REKERNEL_ENABLE : "false"
+  DROIDSPACES_ENABLE : "false"
+  NOMOUNT_ENABLE : "false"
+  BASEBAND_GUARD_ENABLE : "false"
+  BASEBAND_GUARD_BOOT : "false"
+  KPM_ENABLE : "false"
+  KPM_INLINE : "false"
+  KPM_KPATCH_NEXT : "false"
+
+  # ==================== AnyKernel3 ====================
+  AK3_SOURCE : "https://github.com/osm0sis/AnyKernel3.git"
+  AK3_BRANCH : "master"
+  PACK_METHOD : "AnyKernel3"
+  PACK_KMODULES : "false"
+  # 本树 KBUILD_IMAGE=Image.gz（defconfig 未开 BUILD_ARM64_APPENDED_DTB_IMAGE），
+  # dtb 由 AnyKernel3 从原机 boot.img 里保留，所以不用重新生成。
+  GENERATE_DTB : "false"
+  GENERATE_CHIP : "qcom"
+
+  NEED_DTBO : false
+  NEED_SAFE_DTBO : false
+
+  # ==================== Misc ====================
+  PYTHON_VERSION : "2"
+  FREE_MORE_SPACE : "false"
+  BUILD_DEBUGGER : "true"
+  BUILD_OTHER_CONFIG : "false"
+  MERGE_CONFIG_FILES : ""
+  SKIP_PATCH : "false"
+
+  # ==================== 显式声明（build-process / pack-process 会读）====================
+  # ★ KERNEL_ARCH 必须显式写：build-process 的核心分支判定是
+  #     if [ -n "${{ env.CLANG_SOURCE }}" ]; then ... elif [ "${{ env.KERNEL_ARCH }}" == "arm64" ]; then ...
+  #   上游靠 build-ready 写进 $GITHUB_ENV 传递，这里显式声明同值，去掉这层隐性依赖。
+  KERNEL_ARCH : "arm64"
+
+  # 下面这些留空/为 false 就是期望行为
+  UPLOADNAME : ""              # 只用于 ccache key
+  HAVE_NO_DTBO : "false"       # 不往内核塞 mkdtboimg（NEED_DTBO=false）
+  HAVE_NO_DTBO_TOOL : "false"
+  GNU_GCC : "false"            # build-process 里与 GCC_GNU 命名不一致（疑似上游笔误），我们走 GCC_64_SOURCE 分支
+  # 注意：KERNELSU_SOURCE / KERNELSU_BRANCH 只在上面的 "KernelSU" 段声明一次
+  #       （原先这里重复声明过，YAML 同键重复是未定义行为，已删除）
+
+jobs:
+  build-kernel:
+    name: "gts210vewifi (Tab S2 VE WiFi / SM-T813) - KernelSU TAMPER"
+    runs-on: ubuntu-22.04
+
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+      - name: ⏰ Checkout repository
+        uses: actions/checkout@v6
+
+      - name: ⌛️ Compilation environment preparation
+        uses: ./.github/workflows/build-env
+
+      - name: ⚙️ Get necessary tools (clone kernel + KSU + AnyKernel3)
+        uses: ./.github/workflows/build-ready
+
+      - name: 🧩 Fetch submodule (net/wireguard) ★ 3.10 必需
+        shell: bash
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/device_kernel"
+
+          # ============================================================
+          # build-ready 用 `git clone ... --depth=1` 拉内核，
+          # 而 --depth=1 **不会**拉 submodule。本仓库的 .gitmodules 里有一条：
+          #   [submodule "net/wireguard"]
+          #       path = net/wireguard
+          #       url  = https://github.com/syphyr/wireguard-linux-compat
+          # net/Kconfig:78 在 `if INET` 下无条件 `source "net/wireguard/src/Kconfig"`，
+          # 缺了它 defconfig 直接死在：
+          #   net/Kconfig:78: can't open file "net/wireguard/src/Kconfig"
+          # 上游支持的最低内核是 4.4，那些内核没这个 submodule，所以没人踩过。
+          # submodule 只有 ~390 KB，用全量拉（shallow 可能取不到被 pin 的 commit）。
+          # 万一 shallow 克隆里 `git submodule update` 取不到那个 commit，
+          # 下面还有一条 tarball 兜底（照 .gitmodules 里的 url + gitlink sha 直接抓），
+          # 这样"浅克隆取不到 submodule"这个本机验不到的不确定项就不用赌了。
+          # ============================================================
+          echo "::group::[+] .gitmodules"
+          cat .gitmodules || echo "(无 .gitmodules —— 本内核不需要 submodule)"
+          echo "::endgroup::"
+
+          if [ -f .gitmodules ]; then
+            git submodule update --init --recursive || true
+          fi
+
+          if [ -f .gitmodules ] && [ ! -f net/wireguard/src/Kconfig ]; then
+            echo "[-] submodule update 没取到 net/wireguard/src/Kconfig，改走 tarball 兜底"
+            WG_SHA=$(git ls-files -s net/wireguard | awk '{print $2}')
+            WG_URL=$(git config -f .gitmodules submodule.net/wireguard.url \
+                     || echo "https://github.com/syphyr/wireguard-linux-compat")
+            echo "    gitlink sha   = ${WG_SHA:-<空>}"
+            echo "    submodule url = ${WG_URL}"
+            if [ -n "$WG_SHA" ]; then
+              rm -rf net/wireguard && mkdir -p net/wireguard
+              curl -fsSL --retry 3 -o /tmp/wg.tar.gz "${WG_URL%.git}/archive/${WG_SHA}.tar.gz"
+              tar -xzf /tmp/wg.tar.gz -C net/wireguard --strip-components=1
+            fi
+          fi
+
+          if [ -f .gitmodules ] && [ ! -f net/wireguard/src/Kconfig ]; then
+            echo "[-] submodule 仍缺失。已记录的 gitlink："
+            git ls-files -s net/wireguard || true
+            echo "    手工兜底：curl -L ${WG_URL:-https://github.com/syphyr/wireguard-linux-compat} 的 archive/<sha>.tar.gz"
+            echo "    本机已验证可用的那份：syphyr/wireguard-linux-compat @ d45c2e7e7a8beda56cd7ea02dd2a2a1ebd18ceb0（389,901 B）"
+            exit 1
+          fi
+          echo "[+] net/wireguard 就位：$(git -C net/wireguard rev-parse HEAD 2>/dev/null || echo '<无 .git>')"
+          ls -l net/wireguard/src/Kconfig
+
+      - name: 🔗 Patch for no-kprobe
+        run: |
+          # Needn't manual hook —— 开了 CONFIG_KSU_TAMPER_SYSCALL_TABLE 之后，
+          # sys_execve / sys_faccessat / sys_newfstatat / sys_reboot 全部由 syscall 表
+          # 篡改接管，不需要往 fs/exec.c、fs/open.c、fs/stat.c、kernel/sys.c 里塞代码。
+          # 这一步故意留空，只为保持和上游样板一致、留个显式标记。
+
+      - name: 🪛 Extra Kernel Options
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/device_kernel"
+
+          DEFCONFIG="./arch/${KERNEL_ARCH:-arm64}/configs/${{ env.DEFCONFIG_NAME }}"
+          [ -f "$DEFCONFIG" ] || { echo "[-] 找不到 defconfig: $DEFCONFIG"; exit 1; }
+
+          echo "===================== 0) 老内核 vs 新宿主 GCC 补丁 ★★★ ====================="
+          # GCC 10+ 默认 -fno-common。3.10 的 scripts/dtc 里 flex/bison 生成的
+          # `yylloc` 是「试探性定义」，dtc-lexer.lex.o 与 dtc-parser.tab.o 各留一个
+          # 强符号 ⇒ 链接时报：
+          #   scripts/dtc/dtc-parser.tab.o:(.bss+0x50): multiple definition of `yylloc'
+          #   collect2: error: ld returned 1 exit status
+          #   make[3]: *** [scripts/Makefile.host:127: scripts/dtc/dtc] Error 1
+          # ubuntu-22.04 runner 是 GCC 11，必定命中（本机 GCC 11.4.0 已复现，并验证此修法有效）。
+          # 只给 dtc 这一个 hostprog 加 -fcommon，不动全局 HOSTCFLAGS，影响面最小。
+          DTC_MK="scripts/dtc/Makefile"
+          if [ -f "$DTC_MK" ]; then
+            if grep -q 'fcommon' "$DTC_MK"; then
+              echo "[=] dtc -fcommon 已存在，跳过"
+            elif grep -q '^HOSTCFLAGS_DTC :=' "$DTC_MK"; then
+              sed -i 's/^\(HOSTCFLAGS_DTC :=\)/\1 -fcommon/' "$DTC_MK"
+              echo "[+] 已注入 dtc -fcommon -> $(grep -n 'HOSTCFLAGS_DTC :=' "$DTC_MK")"
+            else
+              printf '\n# GCC10+ -fno-common vs yylloc\nHOSTCFLAGS_DTC := -fcommon -I$(src) -I$(src)/libfdt\n' >> "$DTC_MK"
+              echo "[+] 已追加 dtc -fcommon 赋值（锚点未命中，走 fallback）"
+            fi
+          else
+            echo "[!] 没有 scripts/dtc/Makefile，跳过（不致命）"
+          fi
+          echo "    宿主 gcc = $(gcc --version | head -1)"
+
+          echo "===================== 0.5) KSU 源码版本自校验 ★★★ ====================="
+          # 为什么必须校验：Manager 与驱动之间有一个「App Profile 结构版本」约定。
+          # 驱动在 profile_valid() 里做的是严格相等校验：
+          #     if (profile->version != KSU_APP_PROFILE_VER) { pr_info("Unsupported profile version: %d"); return false; }
+          # 而 allow_su（= su 授权）就住在 app profile 里，所以版本一旦不匹配：
+          #     Manager 发 version=2 -> 驱动要求 4 -> 被拒 -> "为该软件更新 App Profile 失败"
+          #                                          -> su 开关弹回、永远授权不了
+          # 本机只能装「官方 Manager v3.1.0」（它 APP_PROFILE_VER=2；再新的官方 Manager
+          # minSdkVersion=31，在 Android 11 上装不上），所以驱动必须停在 VER=2 那一代。
+          KSU_KERNEL_DIR="drivers/kernelsu"
+          [ -d "$KSU_KERNEL_DIR" ] || { echo "[-] 找不到 $KSU_KERNEL_DIR（KSU 没接上）"; exit 1; }
+          echo "    drivers/kernelsu -> $(readlink -f "$KSU_KERNEL_DIR")"
+          if [ -f KernelSU/.git/config ] || [ -d KernelSU/.git ]; then
+            echo "    KSU 源码: $(git -C KernelSU describe --tags --always 2>/dev/null) @ $(git -C KernelSU rev-parse --short HEAD 2>/dev/null)"
+          fi
+          VER=$(grep -m1 -E '^[[:space:]]*#define[[:space:]]+KSU_APP_PROFILE_VER' "$KSU_KERNEL_DIR/app_profile.h" | grep -oE '[0-9]+$')
+          [ -n "$VER" ] || { echo "[-] 读不到 KSU_APP_PROFILE_VER"; exit 1; }
+          echo "    KSU_APP_PROFILE_VER = $VER"
+          if [ "$VER" != "2" ]; then
+            echo "[-] FAIL: KSU_APP_PROFILE_VER=$VER，但本机唯一的官方 Manager v3.1.0 只送 version=2"
+            echo "      -> 会报 '为该软件更新 App Profile 失败'、su 授权不可用"
+            echo "      -> 把 KERNELSU_SOURCE/BRANCH 改回 backslashxx/KernelSU @ v3.1.0-74（见 README §4.6）"
+            exit 1
+          fi
+          echo "[OK]   KSU_APP_PROFILE_VER=2（与官方 Manager v3.1.0 一致）"
+          grep -m1 -E 'KSU_VERSION=' "$KSU_KERNEL_DIR/Makefile" | sed 's/^[[:space:]]*/    /'
+          grep -q 'config KSU_TAMPER_SYSCALL_TABLE' "$KSU_KERNEL_DIR/Kconfig" \
+            && echo "[OK]   Kconfig 里有 KSU_TAMPER_SYSCALL_TABLE" \
+            || { echo "[-] FAIL: 该 KSU 版本没有 KSU_TAMPER_SYSCALL_TABLE"; exit 1; }
+
+          echo "===================== 1) TAMPER 开关 ====================="
+          if grep -q '^CONFIG_KSU_TAMPER_SYSCALL_TABLE=y' "$DEFCONFIG"; then
+            echo "[=] 已存在，跳过"
+          else
+            echo "CONFIG_KSU_TAMPER_SYSCALL_TABLE=y" >> "$DEFCONFIG"
+            echo "[+] 已追加 CONFIG_KSU_TAMPER_SYSCALL_TABLE=y"
+          fi
+
+          echo "===================== 2) selinux_ops 去 static ====================="
+          # KSU Makefile: grep -q "^struct security_operations selinux_ops" <-- 行首锚点
+          if grep -q '^static struct security_operations selinux_ops = {' security/selinux/hooks.c; then
+            sed -i 's/^static struct security_operations selinux_ops = {/struct security_operations selinux_ops = {/' security/selinux/hooks.c
+          fi
+          if ! grep -q '^struct security_operations selinux_ops = {' security/selinux/hooks.c; then
+            echo "[-] FAIL: selinux_ops 仍在 static 状态（sed 锚点没命中）"
+            grep -n 'security_operations selinux_ops' security/selinux/hooks.c || true
+            exit 1
+          fi
+          # 注：v3.1.0-74 的 Makefile 里【没有】selinux_ops 探测宏（那套 probe 是更晚的 master 才加的）。
+          #     但它的 core_hook.c 里有 `extern struct security_operations selinux_ops;`
+          #     ——是直接链接引用，所以去 static 这一步【仍然必需】，否则链接期 undefined reference。
+          echo "[+] selinux_ops 已导出 -> core_hook.c 的 extern 引用可解析（本版无对应探测宏）"
+
+          echo "===================== 3) policy_rwlock 去 static ====================="
+          # KSU Makefile: grep -q "^DEFINE_RWLOCK(policy_rwlock);" <-- 行首锚点
+          if grep -q '^static DEFINE_RWLOCK(policy_rwlock);' security/selinux/ss/services.c; then
+            sed -i 's/^static DEFINE_RWLOCK(policy_rwlock);$/DEFINE_RWLOCK(policy_rwlock);/' security/selinux/ss/services.c
+          fi
+          if ! grep -q '^DEFINE_RWLOCK(policy_rwlock);' security/selinux/ss/services.c; then
+            echo "[-] FAIL: policy_rwlock 仍在 static 状态"
+            grep -n 'DEFINE_RWLOCK(policy_rwlock)' security/selinux/ss/services.c || true
+            exit 1
+          fi
+          echo "[+] policy_rwlock 已导出 -> 将点亮 -DKSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK"
+
+          echo "===================== 4) 全局关警告（官方配方第 4 行）====================="
+          if grep -q '^KBUILD_CFLAGS   :=' Makefile; then
+            sed -i '/KBUILD_CFLAGS   :=/s//& -w/' Makefile
+            grep -m1 -n '^KBUILD_CFLAGS   :=' Makefile
+            echo "[+] 已加 -w"
+          else
+            echo "[!] 未找到 'KBUILD_CFLAGS   :=' 锚点，跳过（不致命）"
+          fi
+
+          echo "===================== 5) .config 断言 ====================="
+          # 这一段的目的是防「编译绿、刷入成功、开机没有 KernelSU、且无任何日志」。
+          # Kconfig 对依赖不满足的 config 会静默丢弃，所以必须回头看 out/.config。
+          #
+          # ★ mkdir -p out 是 3.10 专属必需项 ★
+          # 3.10 顶层 Makefile 对 O= 只做 `cd $(KBUILD_OUTPUT)`，目录不存在就
+          # `$(error output directory "out" does not exist)`；新内核才带 mkdir -p。
+          # 上游 build-ready / build-process 都不建 out/（它们最低支持 4.4），
+          # 所以这一步顺手把 out/ 建好，后面 build-process 直接复用。
+          mkdir -p out
+          make O=out ARCH="${KERNEL_ARCH:-arm64}" "${{ env.DEFCONFIG_NAME }}"
+
+          FAIL=0
+          for sym in CONFIG_KSU CONFIG_KSU_TAMPER_SYSCALL_TABLE; do
+            if grep -q "^${sym}=y" out/.config; then
+              echo "[OK]   ${sym}=y"
+            else
+              echo "[FAIL] ${sym} 没进 .config（被 Kconfig 静默丢弃）"
+              FAIL=1
+            fi
+          done
+
+          echo "----- .config 相关项实况 -----"
+          grep -nE '^CONFIG_KSU|^# CONFIG_KSU' out/.config || echo "(无任何 KSU 项)"
+          echo "----- 依赖项 -----"
+          grep -nE '^CONFIG_(SECCOMP|SECURITY_SELINUX|KALLSYMS_ALL|COMPAT|KEYS|MODULES)=' out/.config || true
+
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "[+] .config 断言全部通过"
+
+      - name: 🚀 Build Process
+        uses: ./.github/workflows/build-process
+
+      - name: 📦 Artifact check
+        if: always()
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE/device_kernel"
+          echo "::group::[+] boot 产物"
+          ls -l out/arch/"${{ env.KERNEL_ARCH }}"/boot/ 2>/dev/null || echo "(无)"
+          echo "::endgroup::"
+          if [ -f error.log ]; then
+            echo "::group::[+] error.log 尾部"
+            tail -n 80 error.log || true
+            echo "::endgroup::"
+          fi
+
+      - name: 🔩 Pack Process
+        uses: ./.github/workflows/pack-process
+
+      - name: ✏️ Upload Artifacts
+        uses: ./.github/workflows/upload-files
